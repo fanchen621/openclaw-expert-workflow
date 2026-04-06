@@ -1,0 +1,31 @@
+{
+  "taskId": "TEMPLATE",
+  "title": "替换为任务标题",
+  "createdBy": "user-request",
+  "createdAt": "ISO-8601时间戳",
+  "timeWindow": {
+    "start": "开始时间",
+    "end": "结束时间",
+    "totalMinutes": 0
+  },
+  "status": "initialized",
+  "subtasks": [
+    {
+      "id": "ST-001",
+      "title": "子任务标题",
+      "description": "详细说明这个子任务做什么",
+      "priority": 1,
+      "estimatedMinutes": 15,
+      "verificationCriteria": [
+        "必须是可客观验证的标准，如：文件存在、测试通过、命令成功",
+        "不能是'我觉得做好了'"
+      ],
+      "status": "pending",
+      "result": null,
+      "startedAt": null,
+      "completedAt": null
+    }
+  ],
+  "checkpoints": [],
+  "errors": []
+}

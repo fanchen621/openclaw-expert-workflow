@@ -1,0 +1,25 @@
+{
+  "version": "1.0.0",
+  "lastUpdated": "2026-04-06T22:00:00+08:00",
+  "tools": [
+    {
+      "id": "openclaw-gateway",
+      "name": "OpenClaw Gateway",
+      "type": "cli-tool",
+      "category": "monitoring",
+      "description": "OpenClaw 核心网关服务，管理所有 agent 会话",
+      "configLocation": "~/.openclaw/openclaw.json",
+      "dependencies": ["node.js"],
+      "healthCheck": "openclaw status",
+      "commonErrors": [
+        {
+          "symptom": "Gateway not running",
+          "cause": "服务未启动或崩溃",
+          "fix": "openclaw gateway restart"
+        }
+      ],
+      "lastVerified": "2026-04-06",
+      "status": "active"
+    }
+  ]
+}
