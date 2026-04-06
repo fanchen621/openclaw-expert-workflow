@@ -17,3 +17,7 @@
 ---
 
 <!-- 在此追加条目 -->
+
+### 2026-04-06 - 工具故障 - OpenClaw Gateway
+- **工具**: OpenClaw Gateway (openclaw-gateway)
+- **健康检查失败**: openclaw status

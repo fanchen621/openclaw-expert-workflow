@@ -1,452 +1,803 @@
 ---
-name: agent-expert-workflow
-description: "Expert-grade persistent workflow engine for OpenClaw. Distills proven patterns from Anthropic Engineering, Claude Code best practices, Ralph Loop, and multi-agent orchestration into executable daily workflows. Solves: MCP amnesia, code modification infinite loops, premature task abandonment, and enables 24/7 expert-level autonomous execution."
+name: expert-agent-workflow
+description: "从 OpenHands/Cline/OpenAI-SDK/Codex/Qwen-Agent 源码中提炼的专家级工作链。解决：MCP遗忘、死循环、长任务敷衍。让 OpenClaw 24/7 像真正的工程专家一样工作。"
 metadata:
+  version: "3.0.0"
   sources:
-    - Anthropic Engineering: Effective Harnesses for Long-Running Agents
-    - Anthropic: How We Built Our Multi-Agent Research System
-    - Claude Code Best Practices (Anthropic official)
-    - Ralph Loop pattern (community)
-    - agentSkills multi-agent dev framework
-  version: "1.0.0"
-  author: distilled-from-top-ai-labs
+    - Claude Code (逆向工程): nO主循环/mW5工具分析/I2A SubAgent/AU2压缩/XN5复杂度
+    - OpenHands: AgentController + StuckDetector (5种卡死检测)
+    - Cline: ToolExecutor + Coordinator + loop-detection
+    - OpenAI Agents SDK: Runner.run_loop + guardrails + max_turns
+    - OpenAI Codex: Exec timeout + sandbox + output cap
+    - Qwen-Agent: Agent._call_tool + tool registry + error handling
+    - Ralph Loop: externalized completion + stop hooks
+    - Anthropic Engineering: dual-agent + feature list + progress file
 ---
 
-# 🧠 Agent Expert Workflow Engine
+# 🔬 Expert Agent Workflow Engine v2
 
-> 让 OpenClaw 像顶尖 AI 团队的专家一样工作：知道自己做什么、怎么做、做错了怎么修、做完怎么验证。
-
----
-
-## 你面对的三个核心问题
-
-| 问题 | 根因 | 本 Skill 的解决方案 |
-|------|------|---------------------|
-| MCP 配置遗忘 | 缺乏持久化的工具状态记忆 | §1 工具状态登记簿 |
-| 代码修改造成死循环 | 缺乏外部验证 + 无迭代上限 | §2 安全编码护栏 |
-| 长任务敷衍执行 | 缺乏任务分解 + 进度追踪 + 完成验证 | §3 持久执行引擎 |
+> 每个工作链都来自真实源码，能追溯到具体模块。不是概念堆砌，是可以执行的代码级流程。
 
 ---
 
-## 使用方式
+## 架构总览
 
-每次启动长时间任务前，**先执行本 SKILL.md 的 §3 持久执行引擎**。
 
-日常代码修改时，**遵循 §2 安全编码护栏**。
+## Quick Start — 一键启动
 
-工具配置变更时，**更新 §1 工具状态登记簿**。
+```bash
+# 1. 初始化长时间任务
+bash agent-expert-workflow/scripts/task-init.sh "你的任务描述" --time-start 05:00 --time-end 07:00
 
----
+# 2. HEARTBEAT 自动循环（已配置在 HEARTBEAT.md）
+# 系统自动: 执行→检测卡死→纠错→学习→进化
 
-## §1 工具状态登记簿 (Tool Registry)
+# 3. 手动执行一次检查
+bash agent-expert-workflow/scripts/master-orchestrator.sh
 
-> 解决问题：MCP 配置遗忘
+# 4. 查看任务状态
+jq .state tasks/*/task.json
 
-### 原则
-每次发现或配置新的 MCP Server、工具、API 集成，**必须立即登记**到以下文件：
+# 5. 查看错误日志
+cat .learnings/ERRORS.md
+```
 
-**文件路径：** `~/.openclaw/workspace/.tool-registry.json`
+## 故障排查
 
-### 注册格式
+| 症状 | 检查 | 修复 |
+|------|------|------|
+| 任务一直 planning | subtasks 为空 | 手动拆解子任务写入 task.json |
+| 任务 paused | pause_reason | max_iterations→自动恢复; time_window→重设 |
+| 任务 blocked | stuck_count >= 3 | 分析 stuck-trace.jsonl，手动介入 |
+| watchdog 误报 | trace 内容 | 确认是否真循环 |
+| evolve 报工具不健康 | healthCheck | 更新 .tool-registry.json |
+
+## 工作链 1: 任务注册与状态机 (Task Registry & State Machine)
+
+> 来源: OpenHands `AgentController.__init__` + `State` + Cline `TaskState`
+
+OpenHands 的 AgentController 初始化时设置 `max_iterations`，Cline 用 `TaskState` 跟踪任务状态。两者的共同点：**状态必须持久化到磁盘，不依赖内存。**
+
+### 任务状态机
+
+```
+                    ┌──────────────┐
+                    │  user_input  │
+                    └──────┬───────┘
+                           ↓
+                    ┌──────────────┐
+               ┌────│  initialized │
+               │    └──────┬───────┘
+               │           ↓
+               │    ┌──────────────┐
+               │    │  planning    │ ← 拆解子任务
+               │    └──────┬───────┘
+               │           ↓
+               │    ┌──────────────┐
+               │    │  executing   │ ← 执行循环
+               │    └──────┬───────┘
+               │           ↓
+               │    ┌──────────────┐   ┌──────────┐
+               │    │  verifying   │──→│ blocked  │
+               │    └──────┬───────┘   └──────────┘
+               │           ↓                   ↑
+               │    ┌──────────────┐           │
+               │    │  completed   │     (重试) │
+               │    └──────────────┘           │
+               │           ↑                   │
+               │    ┌──────────────┐───────────┘
+               └────│  paused      │
+                    └──────────────┘
+```
+
+### 实现：创建任务文件
+
+**每次接受长时间任务时，第一步不是做事，而是注册任务。**
+
+```bash
+TASK_DIR="$HOME/.openclaw/workspace/tasks/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$TASK_DIR"
+```
+
+### task.json 格式
+
+> 来源: Anthropic 工程博客 feature_list.json + OpenHands TaskTrackingAction + Cline FocusChain
 
 ```json
 {
-  "version": "1.0.0",
+  "id": "20260406-220000",
+  "title": "任务标题",
+  "state": "planning",
+  "created_at": "2026-04-06T22:00:00+08:00",
+  "time_window": {
+    "start": "2026-04-06T05:00:00+08:00",
+    "end": "2026-04-06T07:00:00+08:00",
+    "budget_minutes": 120
+  },
+  "max_iterations": 50,
+  "current_iteration": 0,
+  "subtasks": [
+    {
+      "id": "ST-001",
+      "title": "子任务标题",
+      "priority": 1,
+      "state": "pending",
+      "verify": {
+        "type": "command | file_exists | test_pass",
+        "criteria": "具体的验证命令或条件",
+        "expected": "预期结果"
+      },
+      "result": null,
+      "attempts": 0,
+      "max_attempts": 3,
+      "started_at": null,
+      "completed_at": null
+    }
+  ],
+  "checkpoints": [],
+  "stuck_count": 0
+}
+```
+
+**关键设计：**
+- `max_iterations`: 来自 OpenHands `AgentController.__init__(iteration_delta=...)` —— 硬上限，到了就必须停
+- `verify.type`: 来自 Ralph Loop 的 `verificationCriteria` —— **客观验证，不靠 Agent 自评**
+- `max_attempts`: 来自 Cline `loop-detection` —— 单个子任务最多重试 3 次
+- `stuck_count`: 来自 OpenHands `StuckDetector` —— 全局卡死计数
+
+---
+
+## 工作链 2: 循环守护 (Loop Watchdog)
+
+> 来源: OpenHands `StuckDetector` 完整 5 场景检测 + Cline `loop-detection.ts` + OpenAI SDK `reset_tool_choice`
+
+这是解决**死循环**的核心。OpenHands 的 StuckDetector 实现了 5 种卡死场景检测，我把它们翻译成 OpenClaw 可执行的流程。
+
+### 场景 1: 同一动作 + 同一结果（重复 4 次）
+
+> 来源: `StuckDetector._is_stuck_repeating_action_observation`
+
+**检测逻辑：**
+最近 4 次操作的 action 类型完全相同，且 observation 也完全相同 → 卡死
+
+**OpenClaw 实现：**
+```bash
+# 每次执行完一个操作后，追加到 stuck-trace.jsonl
+# 检查时：
+tail -4 ~/.openclaw/workspace/tasks/CURRENT/stuck-trace.jsonl | \
+  jq -r '.action + "|" + .result_hash' | \
+  sort | uniq -c | sort -rn | head -1
+# 如果输出 "4 ..." → 卡死警报
+```
+
+### 场景 2: 同一动作 + 连续错误（重复 3 次）
+
+> 来源: `StuckDetector._is_stuck_repeating_action_error`
+
+**检测逻辑：** 同一个 action 连续 3 次产生 ErrorObservation → 卡死
+
+**OpenClaw 实现：**
+```bash
+# 统计最近 3 条记录
+tail -3 stuck-trace.jsonl | jq -c 'select(.success == false)' | wc -l
+# 如果 == 3 且 action 相同 → 卡死
+```
+
+### 场景 3: Agent 独白（连续 3 条相同自言自语）
+
+> 来源: `StuckDetector._is_stuck_monologue`
+
+**检测逻辑：** Agent 连续 3 次发送完全相同的 MessageAction → 卡死
+
+**OpenClaw 实现：**
+```bash
+# 提取最近 3 条 agent 输出的消息
+tail -3 stuck-trace.jsonl | jq -r '.agent_message' | \
+  sort | uniq -c | sort -rn | head -1
+# 如果 "3 相同消息" → 卡死
+```
+
+### 场景 4: 交替循环（6步模式，A→B→A→B→A→B）
+
+> 来源: `StuckDetector._is_stuck_action_observation_pattern`
+
+**检测逻辑：** 最近 6 个事件形成 A→B→A→B→A→B 模式 → 卡死
+
+**OpenClaw 实现：**
+```bash
+# 提取最近 6 条 action
+tail -6 stuck-trace.jsonl | jq -r '.action'
+# 检查 1==3==5 且 2==4==6 → 交替循环
+```
+
+### 场景 5: 上下文窗口错误循环（连续 10+ 条上下文溢出）
+
+> 来源: `StuckDetector._is_stuck_context_window_error`
+
+**检测逻辑：** 连续 10 次遇到上下文窗口溢出错误 → 卡死
+
+**OpenClaw 实现：**
+```bash
+tail -10 stuck-trace.jsonl | jq -c 'select(.error | contains("context"))' | wc -l
+# 如果 == 10 → 需要压缩上下文
+```
+
+### 综合检测器脚本
+
+```bash
+#!/bin/bash
+# watchdog.sh — 在每次操作后调用
+TRACE_FILE="$1"  # stuck-trace.jsonl 路径
+MAX_ITERATIONS=${2:-50}
+
+ITERATION=$(wc -l < "$TRACE_FILE")
+if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
+  echo "⚠️ MAX_ITERATIONS ($MAX_ITERATIONS) REACHED"
+  echo '{"event":"stuck","type":"max_iterations","count":'$ITERATION'}' >> "$TRACE_FILE"
+  exit 1
+fi
+
+# 检查场景 1-5（上面的逻辑）
+# ... 任一触发则 exit 1
+```
+
+### OpenAI SDK 的 `reset_tool_choice` 机制
+
+> 来源: `Agent.reset_tool_choice = True`
+
+OpenAI SDK 默认在每次工具调用后重置 `tool_choice`，防止模型陷入"必须调用工具"的死循环。
+
+**OpenClaw 对应：** 每次工具调用后，在下一轮 prompt 中加入：
+```
+你可以选择：继续使用工具，或者输出最终结果。不要无意义地重复调用同一个工具。
+```
+
+---
+
+## 工作链 3: 工具执行协调器 (Tool Execution Coordinator)
+
+> 来源: Cline `ToolExecutorCoordinator` + `ToolValidator` + Qwen-Agent `_call_tool`
+
+### Cline 的 Coordinator 模式
+
+Cline 用一个中央协调器 `ToolExecutorCoordinator` 管理所有工具的注册、验证和执行：
+- 每个工具注册 handler
+- 执行前通过 `ToolValidator` 验证
+- Plan Mode 下限制某些工具（FILE_NEW, FILE_EDIT 等只能在 Act Mode 使用）
+
+### OpenClaw 对应：工具注册表 + 执行前验证
+
+**`.tool-registry.json` 结构：**
+
+```json
+{
+  "version": "2.0.0",
   "lastUpdated": "2026-04-06T22:00:00+08:00",
   "tools": [
     {
-      "id": "unique-tool-id",
-      "name": "人类可读名称",
-      "type": "mcp-server | cli-tool | api-integration | skill",
-      "category": "data | code | communication | monitoring | other",
-      "description": "一句话说明这个工具做什么",
-      "configLocation": "配置文件路径，如 ~/.openclaw/openclaw.json 中的 mcp.servers.xxx",
-      "dependencies": ["依赖的其他工具或包"],
-      "healthCheck": "验证工具可用的命令，如 'curl -s http://localhost:3001/health'",
+      "id": "tool-id",
+      "name": "可读名称",
+      "type": "mcp-server | cli-tool | api-integration",
+      "status": "active | broken | unknown",
+      "configLocation": "配置路径",
+      "healthCheck": "验证命令",
+      "dependencies": ["dep1"],
+      "maxRetries": 3,
+      "timeoutMs": 10000,
       "commonErrors": [
         {
-          "symptom": "症状描述",
-          "cause": "原因分析",
-          "fix": "修复步骤"
+          "pattern": "错误模式（正则）",
+          "cause": "原因",
+          "fix": "修复命令"
         }
       ],
       "lastVerified": "2026-04-06",
-      "status": "active | broken | unknown"
+      "usageCount": 0,
+      "errorCount": 0,
+      "lastError": null
     }
   ]
 }
 ```
 
-### 操作规程
+### Qwen-Agent 的错误处理模式
 
-**发现新工具时：**
-1. 读取 `.tool-registry.json`
-2. 添加新条目
-3. 运行 healthCheck 验证
-4. 写回文件
+> 来源: `Agent._call_tool` 异常捕获
 
-**工具出问题时：**
-1. 查 registry 中的 commonErrors
-2. 尝试 fix 方案
-3. 更新 status 和 lastVerified
+Qwen-Agent 在 `_call_tool` 中捕获所有异常，格式化为：`{type}: {message}\nTraceback:\n{traceback}`
 
-**启动新任务时：**
-1. 快速扫描 registry 中 status != "broken" 的工具
-2. 对关键工具运行 healthCheck
+**OpenClaw 对应：** 每次工具调用失败后：
+1. 记录完整错误到 `.tool-registry.json` 的 `lastError`
+2. 检查 `commonErrors` 中是否有匹配的 pattern
+3. 如果有 → 执行 fix 命令
+4. 如果没有 → 记录到 `.learnings/ERRORS.md`
+5. `errorCount++`，如果连续 3 次失败 → 标记 status = "broken"
 
----
+### Codex 的超时与输出上限
 
-## §2 安全编码护栏 (Safe Code Modification)
+> 来源: `DEFAULT_EXEC_COMMAND_TIMEOUT_MS = 10_000` + `EXEC_OUTPUT_MAX_BYTES`
 
-> 解决问题：代码修改造成死循环
+Codex 的每个命令都有：
+- 超时限制（默认 10 秒）
+- 输出大小上限（防止 OOM）
+- 沙箱隔离
 
-### 核心规则：修改前 → 修改中 → 修改后 三段式
-
-#### 修改前 (Pre-Flight Checklist)
-
-- [ ] **读取目标文件完整内容**（不要猜测）
-- [ ] **理解修改的影响范围**（哪些文件会受影响）
-- [ ] **设置迭代上限**（默认 3 轮修改，每轮必须有可验证的进步）
-- [ ] **创建检查点**（`git stash` 或 `git commit -m "checkpoint: before [task]"`）
-
-#### 修改中 (During Modification)
-
-- [ ] **一次只改一个东西**（不要同时改多个文件多个逻辑）
-- [ ] **每改一步就验证**（运行测试/编译/语法检查）
-- [ ] **检测重复修改**：如果同一行代码被改了超过 2 次，**立即停止**，重新分析问题
-- [ ] **迭代计数器**：每轮修改在 `.modification-log` 中记录
-
-#### 修改后 (Post-Modification)
-
-- [ ] **运行完整验证**（测试、编译、lint）
-- [ ] **diff 审查**（`git diff` 确认改动符合预期）
-- [ ] **提交检查点**（`git commit -m "feat/fix: [描述]"`）
-
-### 死循环检测器 (Loop Detector)
-
-**在每次修改代码前，必须执行以下检查：**
-
-```
-检查规则：
-1. 如果最近 5 次 git diff 中，同一文件同一区域被反复修改 → 红色警报，停止
-2. 如果最近 3 次执行结果完全相同 → 红色警报，停止，重新分析
-3. 如果修改导致了新的错误（而非修复原有错误） → 黄色警告，回滚上一步
-4. 如果迭代次数 >= 3 且问题未解决 → 停止，升级到人工介入或换策略
-```
-
-**检测方法：**
-```bash
-# 检查最近的修改是否在同一区域反复改动
-git log --oneline -10
-git diff HEAD~1 HEAD --stat
-
-# 如果同一文件出现在最近多次提交中，触发警报
-```
-
-### 代码修改决策树
-
-```
-需要修改代码？
-├── 读取完整文件内容
-├── 确认修改目标（一句话说清楚）
-├── 设置 max_iterations = 3
-├── FOR iteration in 1..max_iterations:
-│   ├── 做出修改
-│   ├── 运行验证（测试/编译/lint）
-│   ├── 验证通过？ → 提交 + 退出循环 ✅
-│   ├── 验证失败？ → 记录错误到 .modification-log
-│   ├── 检查是否与上次错误相同？
-│   │   ├── 是 → 换策略或回滚
-│   │   └── 否 → 继续迭代
-│   └── iteration == max_iterations？
-│       └── 是 → 停止，记录问题，通知用户 ⚠️
-└── 提交最终结果
-```
+**OpenClaw 对应：** 每个工具调用时：
+- 长命令必须设置超时
+- 输出过长时截断并记录
+- 危险命令前创建 git checkpoint
 
 ---
 
-## §3 持久执行引擎 (Persistent Execution Engine)
+## 工作链 4: 持久执行循环 (Persistent Execution Loop)
 
-> 解决问题：长任务敷衍执行，几分钟就结束
+> 来源: OpenAI Agents SDK `Runner.run()` + `run_loop.py` + Anthropic dual-agent architecture
 
-### 核心架构：任务清单 + 进度追踪 + 完成验证
+### OpenAI SDK 的 run loop 核心逻辑
 
-灵感来源：Anthropic Engineering "Effective Harnesses for Long-Running Agents"
+```python
+# 从 run_loop.py 提取的核心循环：
+while True:
+    response = model.chat(messages, tools)     # 1. 调用 LLM
+    if response.has_final_output:               # 2. 检查是否完成
+        return response.final_output
+    if response.has_handoff:                    # 3. 检查是否需要交接
+        agent = response.handoff_target
+        continue
+    tool_results = execute_tools(response)      # 4. 执行工具
+    messages.extend(tool_results)               # 5. 更新上下文
+    if turns >= max_turns:                      # 6. 硬上限
+        raise MaxTurnsExceeded()
+```
 
-### 3.1 任务初始化 (Init Phase)
+**关键参数：**
+- `max_turns` — 默认有硬上限
+- `guardrails` — 输入/输出护栏检查
+- `tool_use_behavior` — "run_llm_again" | "stop_on_first_tool" | 自定义函数
 
-接到长时间任务时，**不要直接开始做**，先执行初始化：
+### OpenClaw 的任务执行循环
 
-**Step 1: 创建任务目录**
+**每次心跳或 cron 触发时执行：**
+
 ```bash
-mkdir -p ~/.openclaw/workspace/tasks/$(date +%Y%m%d-%H%M%S)-task-name
-TASK_DIR=~/.openclaw/workspace/tasks/$(date +%Y%m%d-%H%M%S)-task-name
+#!/bin/bash
+# task-loop.sh — 任务执行循环
+
+TASK_DIR="$1"
+TASK_JSON="$TASK_DIR/task.json"
+TRACE_FILE="$TASK_DIR/stuck-trace.jsonl"
+PROGRESS_FILE="$TASK_DIR/progress.md"
+
+# 1. 读取当前状态
+STATE=$(jq -r '.state' "$TASK_JSON")
+ITERATION=$(jq -r '.current_iteration' "$TASK_JSON")
+MAX_ITER=$(jq -r '.max_iterations' "$TASK_JSON")
+
+# 2. 硬上限检查 (OpenAI SDK max_turns)
+if [ "$ITERATION" -ge "$MAX_ITER" ]; then
+  jq '.state = "paused" | .pause_reason = "max_iterations"' "$TASK_JSON" > tmp && mv tmp "$TASK_JSON"
+  echo "⚠️ 达到最大迭代次数 $MAX_ITER，暂停任务"
+  exit 0
+fi
+
+# 3. 时间窗口检查 (Codex timeout)
+END_TIME=$(jq -r '.time_window.end' "$TASK_JSON")
+NOW=$(date -Iseconds)
+if [[ "$NOW" > "$END_TIME" ]]; then
+  jq '.state = "paused" | .pause_reason = "time_window_exceeded"' "$TASK_JSON" > tmp && mv tmp "$TASK_JSON"
+  echo "⚠️ 时间窗口已过，暂停任务"
+  exit 0
+fi
+
+# 4. 循环守护检查 (OpenHands StuckDetector)
+bash watchdog.sh "$TRACE_FILE" "$MAX_ITER"
+if [ $? -ne 0 ]; then
+  jq '.state = "blocked" | .stuck_count += 1' "$TASK_JSON" > tmp && mv tmp "$TASK_JSON"
+  echo "🚫 检测到卡死，暂停任务"
+  exit 0
+fi
+
+# 5. 选择下一个子任务
+NEXT=$(jq -r '[.subtasks[] | select(.state == "pending")] | sort_by(.priority) | first | .id // "none"' "$TASK_JSON")
+if [ "$NEXT" = "none" ]; then
+  jq '.state = "completed"' "$TASK_JSON" > tmp && mv tmp "$TASK_JSON"
+  echo "✅ 所有子任务完成"
+  exit 0
+fi
+
+# 6. 更新状态为执行中
+jq --arg id "$NEXT" '(.subtasks[] | select(.id == $id)) |= (.state = "in_progress" | .started_at = now | .attempts += 1)' "$TASK_JSON" > tmp && mv tmp "$TASK_JSON"
+
+# 7. 迭代计数 +1
+jq '.current_iteration += 1' "$TASK_JSON" > tmp && mv tmp "$TASK_JSON"
+
+echo "🔄 执行子任务 $NEXT (迭代 #$((ITERATION+1))/$MAX_ITER)"
 ```
 
-**Step 2: 生成任务清单 (task-list.json)**
+### Anthropic 双 Agent 模式的 OpenClaw 实现
 
-将用户的模糊需求拆解为可验证的子任务：
+> 来源: Anthropic 工程博客 "Effective Harnesses for Long-Running Agents"
 
-```json
-{
-  "taskId": "20260406-220000-expert-workflow",
-  "title": "任务标题",
-  "createdBy": "user-request",
-  "createdAt": "2026-04-06T22:00:00+08:00",
-  "timeWindow": {
-    "start": "2026-04-06T05:00:00+08:00",
-    "end": "2026-04-06T07:00:00+08:00",
-    "totalMinutes": 120
-  },
-  "status": "initialized",
-  "subtasks": [
-    {
-      "id": "ST-001",
-      "title": "子任务描述",
-      "description": "详细说明",
-      "priority": 1,
-      "estimatedMinutes": 15,
-      "verificationCriteria": ["可验证的完成标准1", "标准2"],
-      "status": "pending",
-      "result": null,
-      "startedAt": null,
-      "completedAt": null
-    }
-  ],
-  "checkpoints": [],
-  "errors": []
-}
+**Agent 1 (初始化)** — 只在任务开始时运行一次：
+- 将模糊需求拆解为 `task.json` 中的子任务
+- 每个子任务写好 `verify` 验证标准
+- 生成 `progress.md` 初始模板
+- 创建第一个 git checkpoint
+
+**Agent 2 (执行者)** — 每次心跳/cron 运行：
+- 读取 `task.json` + `progress.md`
+- 选一个 pending 子任务
+- 执行 + 验证
+- 更新 `task.json` + `progress.md`
+- git commit
+
+---
+
+## 工作链 5: 完成验证 (Completion Verification)
+
+> 来源: Ralph Loop `verifyCompletion` + Cline `doesLatestTaskCompletionHaveNewChanges`
+
+### 核心原则：Agent 不可以自己宣布完成
+
+Ralph Loop 的 `verifyCompletion` 是外部函数，不信任 LLM 的自我评估。Cline 有 `doesLatestTaskCompletionHaveNewChanges()` 检查实际代码变更。
+
+### 三级验证
+
+**Level 1 — 命令验证（可信）**
+```bash
+# 验证类型: test_pass
+eval "$TASK.verify.criteria"
+# 例如: npm test && echo "PASS" || echo "FAIL"
+
+# 验证类型: file_exists
+test -f "$TASK.verify.criteria" && echo "PASS" || echo "FAIL"
+
+# 验证类型: command
+eval "$TASK.verify.criteria" 2>&1 | grep -q "$TASK.verify.expected" && echo "PASS" || echo "FAIL"
 ```
 
-**Step 3: 生成进度日志 (progress.md)**
+**Level 2 — 差异验证（可信）**
+```bash
+# 检查是否有实际变更
+git diff --stat HEAD~1 HEAD
+# 如果没有输出 → 没有实际变更，不能标记 completed
+```
+
+**Level 3 — 自评（不可信，仅参考）**
+- Agent 自己说"我觉得做好了" → 忽略
+- 必须 Level 1 或 Level 2 通过才允许 `state = "completed"`
+
+### 防敷衍规则
+
+```
+IF 子任务.attempts >= max_attempts AND verify 未通过:
+  → state = "blocked"
+  → 记录原因到 errors 数组
+  → 通知用户
+
+IF 所有子任务都 completed:
+  → 运行最终验证：所有 verify criteria 再跑一遍
+  → 全部通过 → state = "completed"，生成汇报
+  → 有失败 → 打回对应子任务
+```
+
+---
+
+## 工作链 6: 上下文压缩 (Context Condensation)
+
+> 来源: OpenHands `Condenser` + `CondensationAction` + `CondensationRequestTool`
+
+OpenHands 有专门的 `Condenser` 模块处理上下文溢出：
+- 当历史太长时，Agent 可以调用 `CondensationRequestTool` 请求压缩
+- `Condenser` 会丢弃旧事件，保留摘要
+- `forgotten_event_ids` 记录哪些事件被丢弃了
+
+**OpenClaw 对应：**
+
+```bash
+# 当上下文接近上限时（比如 progress.md > 5000 行）
+# 自动压缩：
+
+# 1. 保留最近的执行日志
+tail -100 "$PROGRESS_FILE" > "$PROGRESS_FILE.recent"
+
+# 2. 生成摘要
+# (由 Agent 在 prompt 中完成)
+
+# 3. 替换
+mv "$PROGRESS_FILE.recent" "$PROGRESS_FILE"
+```
+
+### progress.md 的压缩规则
+
 ```markdown
 # 任务进度日志
 
-## 任务信息
-- 开始时间: 2026-04-06 05:00
-- 预计结束: 2026-04-06 07:00
-- 总子任务数: 5
+## 压缩摘要（自动生成）
+- 已完成 12/20 个子任务
+- 耗时 45 分钟
+- 关键发现：xxx 模式有效，yyy 方法不可行
+- 阻塞问题：zzz
 
-## 当前状态
-- ✅ 已完成: 0/5
-- 🔄 进行中: 无
-- ⏳ 待处理: 5
-
-## 执行日志
-（每完成一个子任务，追加一条记录）
-
-## 关键发现与学习
-（记录执行过程中的发现、踩坑、最佳实践）
-```
-
-### 3.2 任务执行循环 (Execution Loop)
-
-**这是核心——每次执行长任务时严格遵循：**
-
-```
-WHILE 有未完成的子任务 AND 未到时间上限:
-  1. 读取 task-list.json
-  2. 选择优先级最高的 status="pending" 子任务
-  3. 更新 status → "in_progress"，记录 startedAt
-  4. 执行子任务
-  5. 对照 verificationCriteria 逐条验证
-  6. 所有标准通过？
-     → status → "completed"，记录 completedAt 和 result
-     → 更新 progress.md
-     → git commit -m "完成 ST-XXX: [标题]"
-  7. 未通过？
-     → 记录失败原因到 errors 数组
-     → status → "pending"（重新排队）或 "blocked"（阻塞）
-  8. 检查剩余时间，是否足够继续下一个任务
-     → 不够 → 更新 status → "paused"，记录断点
-  9. 每完成 3 个子任务 → 生成中期汇报
-END WHILE
-
-IF 所有子任务完成:
-  → status → "completed"
-  → 生成最终总结报告
-  → 通知用户
-```
-
-### 3.3 完成验证 (Completion Verification)
-
-> **核心原则：Agent 不可以自己宣布任务完成。必须有客观验证。**
-
-灵感来源：Ralph Loop 模式
-
-**验证层级：**
-1. **自动验证**：测试通过、编译成功、文件存在 → 可信
-2. **交叉验证**：用不同方法验证同一结果（如：写了文件后读回来确认）→ 可信
-3. **自评验证**：Agent 判断自己做得好不好 → **不可信**，需对照 task-list.json 的 verificationCriteria
-
-**防敷衍机制：**
-- 子任务没有 verificationCriteria → 不允许标记 completed
-- verificationCriteria 必须是**可客观验证的**（文件存在/测试通过/命令成功），不能是"我觉得做好了"
-
-### 3.4 时间管理 (Time Management)
-
-**在时间窗口内合理分配工作：**
-
-```
-总时间 T 分钟
-├── 预留 10% 作为缓冲 (T * 0.1)
-├── 预留 5% 用于汇报和整理 (T * 0.05)
-├── 可用执行时间 = T * 0.85
-└── 按优先级分配给子任务：
-    ├── P1 任务先分配
-    ├── 每个任务分配 estimatedMinutes
-    ├── 如果总预估 > 可用时间 → 砍掉低优先级任务
-    └── 如果总预估 < 可用时间 → 补充额外优化任务
-```
-
-**心跳检查（每 30 分钟）：**
-- 当前进度 vs 计划进度
-- 是否有阻塞任务需要升级
-- 剩余时间是否充足
-
-### 3.5 断点续传 (Resume After Interruption)
-
-任务被中断后（会话结束、重启等），恢复方法：
-
-```
-1. 扫描 tasks/ 目录找到 status != "completed" 的任务
-2. 读取 task-list.json 和 progress.md
-3. 检查最后一个 checkpoint 的 git commit
-4. 从 status="pending" 的最高优先级任务继续
-5. 如果时间窗口已过 → 通知用户，请求新的时间窗口
+## 最近执行日志（保留最后 20 条）
+...
 ```
 
 ---
 
-## §4 自我进化引擎 (Self-Evolution)
+## 工作链 7: MCP 配置持久化
 
-> 让 OpenClaw 知道如何正确地修复和进化自己
+> 来源: Cline `McpHub` + Qwen-Agent `MCPManager` + OpenAI SDK `MCPServer`
 
-### 4.1 错误驱动进化
+### 核心机制：快照 + 自动恢复
 
-**每次出错后，必须执行：**
-1. 记录错误到 `.learnings/ERRORS.md`
-2. 分析根因（不是症状，是根因）
-3. 决定修复层级：
-   - **即时修复**：改一行代码能解决 → 立即做
-   - **流程修复**：需要改工作方式 → 更新本 SKILL.md 或 AGENTS.md
-   - **知识修复**：需要学习新知识 → 更新 TOOLS.md 或 MEMORY.md
-   - **架构修复**：需要重构 → 记录到 TODO，等专门的重构时间
+```bash
+# 1. MCP 配置快照目录
+MCP_DIR="$HOME/.openclaw/workspace/.mcp-snapshots"
+mkdir -p "$MCP_DIR"
 
-### 4.2 定期自我审查
+# 2. 每次配置变更后快照
+openclaw gateway config.get 2>/dev/null | \
+  python3 -c "import sys,json; json.dump(json.load(sys.stdin),sys.stdout,indent=2)" > \
+  "$MCP_DIR/$(date +%Y%m%d-%H%M%S).json"
 
-**每周一次（可通过 cron 调度）：**
-1. 回顾本周所有错误日志
-2. 找出重复出现的错误模式
-3. 将高频错误转化为新的防护规则
-4. 更新相关 SKILL.md / AGENTS.md / SOUL.md
-
-### 4.3 进化方向指引
-
-**不要盲目进化。遵循优先级：**
-1. **可靠性** > 功能性（先保证不犯错，再考虑做更多）
-2. **安全性** > 效率（先保证安全，再考虑快）
-3. **可维护性** > 创造性（先保证代码可读，再考虑花哨方案）
-4. **用户需求** > 自己的想法（先完成用户要的，再优化自己想的）
+# 3. 恢复时：对比最新快照 vs 当前配置
+LATEST=$(ls -t "$MCP_DIR"/*.json 2>/dev/null | head -1)
+# diff 对比，补回缺失项
+```
 
 ---
 
-## §5 24/7 持久执行方案
+## 工作链 8: 心跳驱动 24/7 执行
 
-> 让 OpenClaw 能够不间断地执行任务
+> 来源: OpenClaw HEARTBEAT.md + cron 机制
 
-### 5.1 心跳驱动执行
-
-利用 OpenClaw 的 HEARTBEAT.md 机制：
+### HEARTBEAT.md 配置
 
 ```markdown
 # HEARTBEAT.md
 
-## 持久任务检查
-1. 扫描 tasks/ 目录，找到 status="in_progress" 或 "paused" 的任务
-2. 如果有 → 读取 task-list.json，继续执行下一个子任务
-3. 如果任务已完成 → 生成汇报，status → "completed"
-4. 如果没有活跃任务 → HEARTBEAT_OK
+## 1. 活跃任务检查
+- 扫描 tasks/ 目录找到 state != "completed" 且 != "paused" 的任务
+- 如果有 → 运行 task-loop.sh 继续执行
+- 如果没有 → 继续下一步
+
+## 2. 自主工作检查（每 4 次心跳执行 1 次）
+- 检查 .learnings/ERRORS.md 是否有未处理的错误
+- 检查 .tool-registry.json 中 status="unknown" 的工具并验证
+- 检查 MEMORY.md 是否需要整理
+- 都没有 → HEARTBEAT_OK
 ```
-
-### 5.2 Cron 驱动执行
-
-对于需要精确定时的任务：
-
-```
-cron 任务配置:
-- schedule: 在指定时间窗口内每 25 分钟触发一次
-- payload: "继续执行 [任务ID] 的下一个子任务"
-- sessionTarget: isolated
-```
-
-### 5.3 自主工作循环
-
-当没有明确任务时，OpenClaw 可以自主选择工作：
-1. 检查 `.learnings/` 中是否有待处理的错误
-2. 检查 `.tool-registry.json` 中是否有工具需要验证
-3. 检查 MEMORY.md 是否需要整理
-4. 检查是否有过期的 memory 文件需要清理
-5. 检查代码仓库是否有未提交的改动
 
 ---
 
-## §6 MCP 配置持久化方案
+## 工作链 9: Claude Code Agent Loop (逆向工程)
 
-> 专门解决 MCP 配置遗忘问题
+> 来源: Claude Code 逆向工程 — `nO` 函数 (chunks.95.mjs:315-330)
 
-### 6.1 MCP 快照机制
+### 核心：无固定轮数的动态循环
 
-每次 MCP 配置变更后，执行：
+Claude Code 不用固定 `for i in range(N)` 循环，而是用 `preventContinuation` 标志动态决定是否继续。
 
-```bash
-# 快照当前 MCP 配置
-openclaw gateway config.get > ~/.openclaw/workspace/.mcp-snapshots/$(date +%Y%m%d-%H%M%S).json
+```
+// Claude Code nO 主循环 (逆向重建)
+async function* nO(messages, system, tools, ...) {
+  let E = false;
+  while (E) {
+    E = false;
+    // 1. 调用 LLM (流式响应 + 中断信号)
+    for await (let chunk of llm_chat(...)) {
+      yield chunk
+    }
+    // 2. 提取工具调用
+    let toolCalls = extractToolUse(assistantMessages);
+    if (!toolCalls.length) return;  // 无工具调用 → 结束
+
+    // 3. 执行工具 (通过 mW5 分析并发安全性)
+    for await (let result of executeTools(toolCalls, ...)) {
+      yield result
+      if (result.type === "system" && result.preventContinuation) return; // 终止信号
+    }
+
+    // 4. 递归调用继续循环
+    yield* nO([...messages, ...newMessages], ...)
+  }
+}
 ```
 
-### 6.2 MCP 注册表
+**终止条件（3 种）：**
+1. 用户中断 — yield 检查中断点，实时响应
+2. 系统级错误 — 工具执行失败无法重试，模型调用失败无备用
+3. 无新信息 — 工具调用结束没有产生状态变化，任务明确完成
 
-在 `.tool-registry.json` 中维护所有 MCP server 的：
-- 名称和描述
-- 配置位置
-- 依赖项
-- 健康检查命令
-- 常见故障和修复方法
+**OpenClaw 对应：** HEARTBEAT.md 中的任务循环不应该有固定轮数，而是在每次迭代后检查：
+- 是否产生了新的文件变更？（git diff）
+- 是否有未完成的子任务？（task.json）
+- watchdog 是否检测到卡死？
+- 时间窗口是否还在？
 
-### 6.3 MCP 恢复流程
+## 工作链 10: Claude Code 工具并发调度 (逆向工程)
 
-发现 MCP 配置丢失时：
-1. 读取最新的 `.mcp-snapshots/` 快照
-2. 对比当前配置
-3. 补回缺失的 MCP server 配置
-4. 验证每个 server 可用
-5. 更新 `.tool-registry.json` 状态
+> 来源: `mW5` 函数 (chunks.95.mjs:410-425) + `gW5=10` 并发限制
+
+### 核心：读并发、写顺序
+
+```javascript
+// mW5 工具安全性分析 (逆向重建)
+function analyzeConcurrency(toolCalls, context) {
+  return toolCalls.reduce((groups, call) => {
+    let tool = context.tools.find(t => t.name === call.name);
+    let isSafe = tool?.isConcurrencySafe(call.input);  // 只读 = true
+    if (isSafe && groups[last]?.isConcurrencySafe)
+      groups[last].blocks.push(call);  // 安全工具合并执行
+    else
+      groups.push({ isConcurrencySafe: isSafe, blocks: [call] });  // 不安全工具单独执行
+    return groups;
+  }, []);
+}
+```
+
+**工具分类：**
+
+| 类型 | 并发安全 | 工具 |
+|------|---------|------|
+| 读操作 | ✅ 并发 | Read, LS, Glob, Grep, WebFetch, WebSearch |
+| 写操作 | ❌ 顺序 | Edit, Write, Bash, Delete, Task |
+
+**OpenClaw 对应：** 当 Agent 需要执行多个操作时：
+1. 先分析哪些可以并发（读文件、查日志、搜索）
+2. 再分析哪些必须串行（写文件、执行命令、修改配置）
+3. 读操作先全部完成，再逐个执行写操作
+
+## 工作链 11: Claude Code SubAgent 机制 (逆向工程)
+
+> 来源: `I2A` 函数 (chunks.99.mjs) + `KN5` 结果聚合
+
+### 核心：无状态 SubAgent + LLM 聚合
+
+```javascript
+// I2A SubAgent 实例化 (逆向重建)
+async function* createSubAgent(task, index, parentContext) {
+  let sessionId = generateId();
+  let systemPrompt = buildSystemPrompt(parentContext);
+
+  // SubAgent 有独立上下文，但继承工具权限
+  let result = await runAgentLoop(task, {
+    sessionId,
+    systemPrompt,
+    tools: parentContext.tools,
+    isSubAgent: true
+  });
+
+  return {
+    agentIndex: index,
+    content: result.messages,
+    tokens: result.usage.total,
+    toolUseCount: result.toolCalls.length
+  };
+}
+
+// KN5 结果聚合 (用 LLM 合并，不是算法)
+function buildSynthesisPrompt(originalTask, agentResults) {
+  return `Original task: ${originalTask}
+
+I've assigned multiple agents to tackle this task.
+${agentResults.map((r, i) => `== AGENT ${i+1} RESPONSE ==\n${r.content}`).join('\n\n')}
+
+Based on all the information, synthesize a response that:
+1. Combines key insights from all agents
+2. Resolves any contradictions
+3. Presents a unified solution
+4. Includes all important details and code examples
+5. Is well-structured and complete`;
+}
+```
+
+**OpenClaw 对应：** 当任务太复杂时，不要硬扛，而是：
+1. 将任务拆成 N 个独立子任务
+2. 每个子任务用独立的 SubAgent 处理（可用 sessions_spawn）
+3. 收集所有结果后，用 LLM 合成最终报告
+4. 并行上限 10 个
+
+## 工作链 12: Claude Code 八段式上下文压缩 (逆向工程)
+
+> 来源: `AU2` 函数 (chunks.94.mjs:1780-1850) + 92% 阈值
+
+### 核心：结构化压缩，不是简单截断
+
+Claude Code 在 Token 使用率达到 **92%** 时触发八段式压缩：
+
+```
+压缩结构：
+1. 用户的主要请求和意图
+2. 关键技术概念
+3. 相关的文件位置
+4. 出现的问题及其解决方案
+5. 问题解决的思路方法结果
+6. 所有用户消息的完整记录和时间线
+7. 待完成的任务和当前工作
+8. 下一步计划
+```
+
+**OpenClaw 对应：** 当 `progress.md` 或会话上下文过长时：
+```markdown
+## 压缩摘要（自动生成）
+### 1. 核心任务
+[用户最初要什么]
+
+### 2. 关键发现
+[学到了什么有用的东西]
+
+### 3. 文件地图
+[改了哪些文件，为什么]
+
+### 4. 问题与解决
+[遇到什么问题，怎么解决的]
+
+### 5. 当前状态
+[做到了哪里]
+
+### 6. 待办事项
+[还有什么没做]
+```
+
+## 工作链 13: Claude Code 复杂度评估 (逆向工程)
+
+> 来源: `XN5` + `FN5` + `WN5` 函数 (chunks.99.mjs:2736-2820)
+
+### 核心：四级复杂度评分决定执行策略
+
+```
+HIGHEST (31999分) → 触发多 Agent 并行处理
+MIDDLE  (10000分) → 单 Agent + TodoWrite 任务管理
+BASIC   (4000分)  → 单 Agent 直接执行
+NONE    (0分)     → 简单回复，不需要工具
+```
+
+**模式匹配示例：**
+- 输入包含 "深入思考"、"全面分析" → HIGHEST
+- 输入包含 "帮我写"、"创建一个" → MIDDLE
+- 输入包含 "查看"、"读取" → BASIC
+- 输入是问候语 → NONE
+
+**OpenClaw 对应：** 收到任务时先评估复杂度：
+1. 简单任务（BASIC）→ 直接做，不需要创建 task.json
+2. 中等任务（MIDDLE）→ 创建 task.json，单 Agent 逐个执行
+3. 复杂任务（HIGHEST）→ 创建 task.json + 拆子任务 + 考虑 SubAgent 并行
 
 ---
 
-## 快速参考卡片
+## 快速参考
 
-| 场景 | 做什么 |
-|------|--------|
-| 开始长时间任务 | §3：创建 task-list.json + progress.md |
-| 修改代码 | §2：三段式 + 死循环检测 |
-| 配置了新工具 | §1：更新 .tool-registry.json |
-| 任务中断了 | §3.5：断点续传 |
-| 犯了错误 | §4.1：错误驱动进化 |
-| MCP 配置丢了 | §6：MCP 恢复流程 |
-| 没有明确任务 | §5.3：自主工作循环 |
+| 问题 | 工作链 | 核心机制 |
+|------|--------|----------|
+| MCP 忘记了 | §7 | .mcp-snapshots/ + 自动对比恢复 |
+| 死循环 | §2 | 5 场景检测 + max_iterations 硬上限 |
+| 敷衍执行 | §4 + §5 | task.json 状态机 + 客观验证 + max_attempts |
+| 上下文溢出 | §6 | 进度日志压缩 + 摘要保留 |
+| 工具出错 | §3 | 错误计数 + pattern 匹配 + 自动修复 |
+| 24/7 执行 | §8 | HEARTBEAT.md + task-loop.sh |
 
 ---
 
-## 附录：设计原则来源
+## 附录：源码映射
 
-| 原则 | 来源 |
-|------|------|
-| 功能列表 + 进度追踪 | Anthropic: Effective Harnesses for Long-Running Agents |
-| 完成信号 + Stop Hook | Ralph Loop 模式 |
-| 协调器-工作器模式 | Anthropic: Multi-Agent Research System |
-| CLAUDE.md 维护 | Claude Code Best Practices |
-| TDD + 验证闭环 | Claude Code Best Practices |
-| 并行工具调用 | Anthropic Multi-Agent 系统 |
-| 角色边界 | agentSkills Multi-Agent 规范 |
-| 错误日志 + 自我改进 | Self-Improving Agent Skill |
+| 工作链 | 来源代码 | 文件/模块 |
+|--------|----------|-----------|
+| Agent Loop | **Claude Code 逆向** | `chunks.95.mjs:315-330` — `nO` 主循环函数 |
+| 工具并发调度 | **Claude Code 逆向** | `chunks.95.mjs:410-425` — `mW5` 安全分析 |
+| SubAgent | **Claude Code 逆向** | `chunks.99.mjs` — `I2A` 实例化 + `KN5` 聚合 |
+| 八段式压缩 | **Claude Code 逆向** | `chunks.94.mjs:1780-1850` — `AU2` 压缩函数 |
+| 复杂度评估 | **Claude Code 逆向** | `chunks.99.mjs:2736-2820` — `XN5`/`FN5`/`WN5` |
+| 任务状态机 | OpenHands | `controller/agent_controller.py` — `AgentController.__init__` |
+| 循环守护 | OpenHands | `controller/stuck.py` — `StuckDetector.is_stuck()` 5 场景 |
+| 循环守护 | Cline | `core/task/loop-detection.ts` — `checkRepeatedToolCall()` |
+| 循环守护 | OpenAI SDK | `agents/agent.py` — `reset_tool_choice = True` |
+| 工具协调器 | Cline | `core/task/ToolExecutor.ts` — `ToolExecutorCoordinator` |
+| 工具协调器 | Qwen-Agent | `qwen_agent/agent.py` — `Agent._call_tool()` |
+| 执行循环 | OpenAI SDK | `agents/run_internal/run_loop.py` — `run_single_turn()` |
+| 执行循环 | Anthropic | 工程博客 "Effective Harnesses for Long-Running Agents" |
+| 完成验证 | Ralph Loop | `ralph-loop-agent` — `verifyCompletion()` |
+| 上下文压缩 | OpenHands | `agenthub/codeact_agent/codeact_agent.py` — `Condenser` |
+| 超时控制 | Codex | `codex-rs/core/src/exec.rs` — `DEFAULT_EXEC_COMMAND_TIMEOUT_MS` |
+| 输出上限 | Codex | `codex-rs/core/src/exec.rs` — `EXEC_OUTPUT_MAX_BYTES` |

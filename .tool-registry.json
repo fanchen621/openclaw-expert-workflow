@@ -9,7 +9,9 @@
       "category": "monitoring",
       "description": "OpenClaw 核心网关服务，管理所有 agent 会话",
       "configLocation": "~/.openclaw/openclaw.json",
-      "dependencies": ["node.js"],
+      "dependencies": [
+        "node.js"
+      ],
       "healthCheck": "openclaw status",
       "commonErrors": [
         {
@@ -19,7 +21,7 @@
         }
       ],
       "lastVerified": "2026-04-06",
-      "status": "active"
+      "status": "broken"
     }
   ]
 }
